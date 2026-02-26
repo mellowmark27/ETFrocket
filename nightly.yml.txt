@@ -1,0 +1,124 @@
+name: MomentumLens — Nightly Pipeline
+
+on:
+  # Run Monday–Friday at 18:00 UTC (6pm, ~90 mins after LSE close)
+  schedule:
+    - cron: "0 18 * * 1-5"
+
+  # Allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      lookback:
+        description: "Lookback window in months"
+        required: false
+        default: "12"
+        type: choice
+        options: ["3", "6", "12"]
+      dry_run:
+        description: "Dry run (no DB writes)"
+        required: false
+        default: false
+        type: boolean
+      export_csv:
+        description: "Export scored CSV as artifact"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  run-pipeline:
+    name: Daily Momentum Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Checkout repo ───────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ───────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ── 3. Install dependencies ────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Restore database from cache ────────────────────────────
+      #    The DB is cached between runs so history accumulates.
+      #    Cache key rotates monthly to prevent unbounded growth.
+      - name: Restore database cache
+        uses: actions/cache@v4
+        with:
+          path: momentum_lens.db
+          key: momentum-db-${{ runner.os }}-${{ hashFiles('database.py') }}-${{ steps.date.outputs.month }}
+          restore-keys: |
+            momentum-db-${{ runner.os }}-${{ hashFiles('database.py') }}-
+            momentum-db-${{ runner.os }}-
+
+      # ── 5. Get current month for cache key ────────────────────────
+      - name: Get month for cache key
+        id: date
+        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
+
+      # ── 6. Run the pipeline ────────────────────────────────────────
+      - name: Run momentum pipeline
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python run_daily.py \
+            --lookback ${{ github.event.inputs.lookback || '12' }} \
+            --export \
+            ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+
+      # ── 7. Also run 6-month lookback (second signal) ──────────────
+      - name: Run 6M lookback (secondary signal)
+        run: |
+          python run_daily.py \
+            --lookback 6 \
+            --export \
+            ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+        continue-on-error: true   # don't fail the workflow if this errors
+
+      # ── 8. Show DB status ─────────────────────────────────────────
+      - name: Database status
+        run: python run_daily.py --status
+
+      # ── 9. Upload CSV exports as artifacts ─────────────────────────
+      - name: Upload CSV exports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: momentum-scores-${{ github.run_number }}
+          path: exports/
+          retention-days: 90
+
+      # ── 10. Upload logs ────────────────────────────────────────────
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 30
+
+      # ── 11. Save updated DB to cache ──────────────────────────────
+      #    (handled automatically by actions/cache when key is found)
+
+      # ── 12. Notify on failure ─────────────────────────────────────
+      # Uncomment and configure to send email/Slack alerts on failure
+      # - name: Notify on failure
+      #   if: failure()
+      #   uses: actions/github-script@v7
+      #   with:
+      #     script: |
+      #       github.rest.issues.create({
+      #         owner: context.repo.owner,
+      #         repo: context.repo.repo,
+      #         title: `Pipeline failed on ${new Date().toISOString().split('T')[0]}`,
+      #         body: 'The nightly momentum pipeline failed. Check the Actions log.',
+      #         labels: ['pipeline-failure']
+      #       })
